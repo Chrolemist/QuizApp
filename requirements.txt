@@ -1,0 +1,8 @@
+# Core runtime dependencies for the Quiz App
+# Python 3.10+ recommended (uses | union types)
+
+# Dash web framework (includes Flask, Plotly as deps)
+dash>=3.0,<4.0
+
+# Data handling
+pandas>=2.1,<3.0
