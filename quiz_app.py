@@ -3,6 +3,7 @@ import io
 import json
 import hashlib
 import os
+import random
 from datetime import datetime
 from typing import List, Dict, Any, Tuple
 
@@ -74,10 +75,16 @@ def parse_correct_indices(options: List[str], correct_cell: str) -> List[int]:
             if len(tn) == 1 and tn.isalpha():
                 idx = ord(tn.upper()) - ord("A")
             else:
-                # Try numeric 1-based indices
+                # Try numeric indices. Support both 1-based (common in sheets) and 0-based (robustness).
                 try:
                     num = int(tn)
-                    idx = num - 1
+                    # Prefer 1-based if in range; otherwise accept 0-based if valid
+                    if 1 <= num <= len(options):
+                        idx = num - 1
+                    elif 0 <= num < len(options):
+                        idx = num
+                    else:
+                        idx = None
                 except Exception:
                     idx = None
         if idx is not None and 0 <= idx < len(options):
@@ -93,11 +100,16 @@ def parse_dataframe(df: pd.DataFrame) -> Dict[str, Any]:
     if df.shape[1] < 3:
         raise ValueError("Expected at least 3 columns: Question, Options, Correct")
 
-    # Normalize column names and take first three columns
-    df = df.iloc[:, :3].copy()
-    df.columns = ["Question", "Options", "Correct"]
+    # Normalize column names and take first 3 or 4 columns (Selected is optional 4th)
+    use_cols = 4 if df.shape[1] >= 4 else 3
+    df = df.iloc[:, :use_cols].copy()
+    if use_cols == 3:
+        df.columns = ["Question", "Options", "Correct"]
+    else:
+        df.columns = ["Question", "Options", "Correct", "Selected"]
 
     questions: List[Dict[str, Any]] = []
+    prefill_selected: List[List[int]] = []
     for _, row in df.iterrows():
         q_raw = str(row["Question"]).strip()
         opts = detect_token_list(row["Options"])  # split into list
@@ -110,6 +122,12 @@ def parse_dataframe(df: pd.DataFrame) -> Dict[str, Any]:
             "options": opts,
             "correct": correct_idx,
         })
+        # Optional prefill of selected answers from file (if present)
+        if "Selected" in df.columns:
+            sel = parse_correct_indices(opts, row.get("Selected"))
+        else:
+            sel = []
+        prefill_selected.append(sel)
 
     if not questions:
         raise ValueError("No valid questions found. Ensure columns are filled and options are separated by '|' or newlines.")
@@ -117,11 +135,14 @@ def parse_dataframe(df: pd.DataFrame) -> Dict[str, Any]:
     # Create a deterministic hash for dataset identity
     h = hashlib.sha256(json.dumps(questions, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()[:12]
 
-    return {
+    payload = {
         "title": "Uploaded Quiz",
         "hash": h,
         "questions": questions,
     }
+    if any(len(s) > 0 for s in prefill_selected):
+        payload["prefill_selected"] = prefill_selected
+    return payload
 
 
  
@@ -288,6 +309,7 @@ app.index_string = (
 
 CSV_DIR = os.path.join(os.path.dirname(__file__), "csv")
 TRASH_DIR = os.path.join(CSV_DIR, "trash")
+PROGRESS_SUFFIX = ".progress.csv"
 
 
 def ensure_csv_dir() -> str:
@@ -331,18 +353,101 @@ def _unique_path_in_dir(directory: str, basename: str) -> str:
         i += 1
 
 
-def dataset_to_csv(dataset: Dict[str, Any], file_path: str) -> None:
+def dataset_to_csv(dataset: Dict[str, Any], file_path: str, selected_map: Dict[int, List[int]] | None = None) -> None:
     rows = []
-    for q in dataset.get("questions", []):
-        options = q.get("options", [])
-        correct_idx = q.get("correct", [])
+    for idx, q in enumerate(dataset.get("questions", [])):
+        options = q.get("options", []) or []
+        correct_idx = q.get("correct", []) or []
         opts_joined = "|".join(options)
-        # Save correct as option texts joined by |
-        correct_texts = [options[i] for i in correct_idx if 0 <= i < len(options)]
+        # Save correct answers as the option texts joined by '|'
+        correct_texts = [options[i] for i in correct_idx if isinstance(i, int) and 0 <= i < len(options)]
         correct_joined = "|".join(correct_texts)
-        rows.append({"Question": q.get("q", ""), "Options": opts_joined, "Correct": correct_joined})
-    df = pd.DataFrame(rows, columns=["Question", "Options", "Correct"])
+        row = {
+            "Question": q.get("q", ""),
+            "Options": opts_joined,
+            "Correct": correct_joined,
+        }
+        if selected_map is not None:
+            sel = selected_map.get(idx, []) if isinstance(selected_map, dict) else []
+            # Store as pipe-joined option texts (more stable across shuffles and edits)
+            try:
+                sel_texts = [options[i] for i in sel if isinstance(i, int) and 0 <= i < len(options)]
+            except Exception:
+                sel_texts = []
+            row["Selected"] = "|".join(sel_texts)
+        rows.append(row)
+    columns = ["Question", "Options", "Correct"] + (["Selected"] if selected_map is not None else [])
+    df = pd.DataFrame(rows, columns=columns)
     df.to_csv(file_path, index=False, sep=";", encoding="utf-8-sig")
+
+
+def _progress_path_for_selected(selected_id: str | None) -> str | None:
+    if not (isinstance(selected_id, str) and selected_id.startswith("file:")):
+        return None
+    base_path = selected_id.split(":", 1)[1]
+    root, _ = os.path.splitext(base_path)
+    return f"{root}{PROGRESS_SUFFIX}"
+
+
+def save_progress_to_csv(state: Dict[str, Any] | None, quiz_data: Dict[str, Any] | None, selected_id: str | None) -> None:
+    try:
+        if not state or not quiz_data:
+            return
+        path = _progress_path_for_selected(selected_id)
+        if not path:
+            return
+        n = len(quiz_data.get("questions", []))
+        rows: List[Dict[str, Any]] = []
+        answers = state.get("answers", {}) if isinstance(state, dict) else {}
+        for i in range(n):
+            sel = answers.get(str(i), {}).get("selected", [])
+            # Store indices as pipe-joined numbers
+            sel_str = "|".join(str(x) for x in sel)
+            rows.append({"Index": i, "Selected": sel_str, "Current": state.get("current", 0) if i == 0 else ""})
+        df = pd.DataFrame(rows, columns=["Index", "Selected", "Current"])
+        df.to_csv(path, index=False, sep=";", encoding="utf-8-sig")
+    except Exception:
+        # Best-effort persistence; ignore failures
+        pass
+
+
+def load_progress_from_csv(selected_id: str | None, expected_n: int) -> Tuple[Dict[str, Any], int] | None:
+    try:
+        path = _progress_path_for_selected(selected_id)
+        if not path or not os.path.exists(path):
+            return None
+        df = pd.read_csv(path, sep=";", engine="python")
+        answers: Dict[str, Any] = {}
+        current = 0
+        for _, row in df.iterrows():
+            i = int(row.get("Index")) if not pd.isna(row.get("Index")) else None
+            if i is None:
+                continue
+            if 0 <= i < expected_n:
+                sel_str = str(row.get("Selected") or "")
+                sel_vals = [int(x) for x in sel_str.split("|") if str(x).strip().isdigit()]
+                answers[str(i)] = {"selected": sel_vals}
+                # grab Current from first row if present
+                if i == 0:
+                    try:
+                        cur_val = row.get("Current")
+                        if pd.isna(cur_val):
+                            cur_val = 0
+                        current = int(cur_val)
+                    except Exception:
+                        current = 0
+        return {"answers": answers}, int(current)
+    except Exception:
+        return None
+
+
+def delete_progress_file(selected_id: str | None) -> None:
+    try:
+        path = _progress_path_for_selected(selected_id)
+        if path and os.path.exists(path):
+            os.remove(path)
+    except Exception:
+        pass
 
 
 def load_all_csv_datasets() -> List[Dict[str, Any]]:
@@ -482,10 +587,12 @@ app.layout = html.Div(
                 ]),
                 html.Div(className="card-footer d-flex gap-2", children=[
                     html.Button("Prev", id="btn_prev", className="btn btn-secondary"),
-                    html.Button("Submit", id="btn_submit", className="btn btn-primary"),
                     html.Button("Next", id="btn_next", className="btn btn-secondary"),
+                    html.Button("Slumpa alternativ", id="btn_shuffle_options", className="btn btn-outline-info btn-sm"),
+                    html.Button("Slumpa frågor", id="btn_shuffle_questions", className="btn btn-outline-info btn-sm"),
                     html.Div(className="flex-grow-1"),
                     html.Button("Restart", id="btn_reset", className="btn btn-outline-danger"),
+                    html.Button("Submit", id="btn_submit", className="btn btn-primary"),
                 ]),
             ]),
             # Progress over time plot
@@ -620,14 +727,29 @@ def on_select_dataset(selected_value, entries):
     Output("quiz_state", "data"),
     Input("quiz_data", "data"),
     State("quiz_state", "data"),
+    State("selected_dataset", "data"),
 )
-def init_or_retain_state(quiz_data, state):
+def init_or_retain_state(quiz_data, state, selected_id):
     if not quiz_data:
         return no_update
     dataset_hash = quiz_data.get("hash")
     if state and state.get("dataset_hash") == dataset_hash:
         # keep existing
         return state
+    # Prefill from dataset file if it contains a 'Selected' column
+    n = len(quiz_data.get("questions", []))
+    prefill = quiz_data.get("prefill_selected") or []
+    if prefill:
+        new_state = default_state(dataset_hash)
+        answers: Dict[str, Any] = {}
+        for i in range(min(n, len(prefill))):
+            sel = prefill[i] or []
+            # correctness can be derived for feedback display if needed
+            corr = quiz_data.get("questions", [])[i].get("correct", [])
+            answers[str(i)] = {"selected": sel, "correct": sorted(sel) == sorted(corr)}
+        new_state["answers"] = answers
+        new_state["current"] = min(max(0, new_state.get("current", 0)), max(0, n - 1))
+        return new_state
     # else initialize new state for this dataset
     return default_state(dataset_hash)
 
@@ -656,9 +778,10 @@ def _unique_csv_path_for_title(title: str) -> str:
     Output("editor_status", "children", allow_duplicate=True),
     Input("quiz_data", "data"),
     State("selected_dataset", "data"),
+    State("quiz_state", "data"),
     prevent_initial_call=True,
 )
-def autosave_on_quiz_data(quiz_data, selected_id):
+def autosave_on_quiz_data(quiz_data, selected_id, state):
     """Auto-save current quiz_data to csv. Create or rename file based on title changes.
     Triggers whenever quiz_data changes (from editor edits/new/add/delete).
     """
@@ -676,6 +799,7 @@ def autosave_on_quiz_data(quiz_data, selected_id):
 
     # If we have a current file, decide whether to rename or overwrite
     target_path = desired_path
+    renamed = False
     if current_path and os.path.exists(current_path):
         current_base = os.path.splitext(os.path.basename(current_path))[0]
         desired_base = os.path.splitext(os.path.basename(desired_path))[0]
@@ -692,26 +816,41 @@ def autosave_on_quiz_data(quiz_data, selected_id):
             except Exception:
                 # fallback: keep current file
                 target_path = current_path
+            else:
+                renamed = True
 
     # Write dataset to target_path
     try:
-        dataset_to_csv(quiz_data, target_path)
+        # Preserve current selections from state when writing due to editor changes
+        sel_map: Dict[int, List[int]] | None = None
+        if isinstance(state, dict):
+            sel_map = {}
+            for k, v in (state.get("answers", {}) or {}).items():
+                try:
+                    i = int(k)
+                except Exception:
+                    continue
+                sel_map[i] = list(v.get("selected", []))
+        dataset_to_csv(quiz_data, target_path, selected_map=sel_map)
     except Exception:
         # if write fails, do not update lists
         raise PreventUpdate
 
-    # Reload entries and update selector (no sample fallback)
+    # Only reload dataset list if we actually renamed the file (title change)
+    new_id = f"file:{os.path.abspath(target_path)}"
+    editor_msg = html.Div([html.Span("Auto-saved ", className="text-success"), html.Code(os.path.basename(target_path))])
+    if not renamed:
+        # Avoid reloading list to prevent transient parse races that could clear selection
+        return no_update, no_update, no_update, no_update, no_update, editor_msg
+
     datasets = load_all_csv_datasets()
     entries = []
     for d in datasets:
         fid = f"file:{os.path.abspath(d.get('source_path'))}"
         title2 = d.get("title") or os.path.splitext(os.path.basename(d.get("source_path", "")))[0]
         entries.append({"id": fid, "title": title2, "data": d})
-
     options = [{"label": e["title"], "value": e["id"]} for e in entries]
-    new_id = f"file:{os.path.abspath(target_path)}"
     status = html.Small(f"Auto-saved to csv/{os.path.basename(target_path)} • {len(entries)} file(s)", className="text-muted")
-    editor_msg = html.Div([html.Span("Auto-saved ", className="text-success"), html.Code(os.path.basename(target_path))])
     return entries, options, new_id, status, new_id, editor_msg
 
 
@@ -728,7 +867,11 @@ def render_answer_inputs(options: List[str], multi: bool, selected: List[int] | 
 def compute_progress(state: Dict[str, Any], total: int) -> Tuple[int, int]:
     if not state:
         return 0, total
-    answered = sum(1 for _ in state.get("answers", {}).values())
+    # Count only questions that have a non-empty selection
+    ans = state.get("answers", {}) or {}
+    def _countable(v: Any) -> bool:
+        return isinstance(v, dict) and isinstance(v.get("selected"), list) and len(v.get("selected")) > 0
+    answered = sum(1 for v in ans.values() if _countable(v))
     return answered, total
 
 
@@ -895,18 +1038,25 @@ def evaluate_answer(selected: List[int] | int | None, correct: List[int]) -> Tup
     return chosen, sorted(chosen) == sorted(correct)
 
 
+## merged per-question submit into the single Submit callback below
+
+
 @callback(
     Output("quiz_state", "data", allow_duplicate=True),
+    Output("quiz_stats", "data", allow_duplicate=True),
     Output("feedback", "children", allow_duplicate=True),
+    Output("quiz_data", "data", allow_duplicate=True),
     Input("btn_submit", "n_clicks"),
     State("quiz_state", "data"),
     State("quiz_data", "data"),
     State("answer_input", "value"),
+    State("selected_dataset", "data"),
+    State("quiz_stats", "data"),
     prevent_initial_call=True,
 )
-def on_submit(n_clicks, state, quiz_data, selected):
+def on_submit(n_clicks, state, quiz_data, selected, selected_id, stats):
     if not quiz_data or not state:
-        return no_update, no_update
+        return no_update, no_update, no_update, no_update
     idx = int(state.get("current", 0))
     q = quiz_data["questions"][idx]
     chosen, is_correct = evaluate_answer(selected, q.get("correct", []))
@@ -928,44 +1078,68 @@ def on_submit(n_clicks, state, quiz_data, selected):
             html.Ul(items, className="mt-2"),
         ], className="alert alert-warning")
 
-    return new_state, fb
-
-
-@callback(
-    Output("quiz_state", "data", allow_duplicate=True),
-    Output("quiz_stats", "data", allow_duplicate=True),
-    Input("quiz_state", "data"),
-    State("quiz_data", "data"),
-    State("quiz_stats", "data"),
-    prevent_initial_call=True,
-)
-def log_attempt_if_finished(state, quiz_data, stats):
-    # Log an attempt once when all questions have been answered
-    if not state or not quiz_data:
-        raise PreventUpdate
+    # After recording this question, decide whether to finish the attempt
     n = len(quiz_data.get("questions", []))
-    if n <= 0:
-        raise PreventUpdate
-    answers = state.get("answers", {})
-    # Check completion
-    completed = all(str(i) in answers for i in range(n))
-    if not completed:
-        raise PreventUpdate
-    # Prevent duplicate logging
-    if state.get("finished_at"):
-        raise PreventUpdate
-    correct = sum(1 for i in range(n) if answers.get(str(i), {}).get("correct"))
-    pct = round((correct / n) * 100, 2)
-    ts = datetime.utcnow().isoformat() + "Z"
-    dataset_key = quiz_data.get("hash")
-    stats = stats or {}
-    arr = list(stats.get(dataset_key, []))
-    arr.append({"ts": ts, "total": n, "correct": correct, "pct": pct})
-    stats[dataset_key] = arr
-    # Mark state as finished to avoid re-logging
-    new_state = dict(state)
-    new_state["finished_at"] = ts
-    return new_state, stats
+    completed = all(str(i) in new_state.get("answers", {}) for i in range(n))
+    if completed:
+        # Compute score and log stats
+        correct = sum(1 for i in range(n) if new_state.get("answers", {}).get(str(i), {}).get("correct"))
+        pct = round((correct / n) * 100, 2) if n else 0
+        ts = datetime.utcnow().isoformat() + "Z"
+        stats = stats or {}
+        dataset_key = quiz_data.get("hash")
+        arr = list(stats.get(dataset_key, []))
+        arr.append({"ts": ts, "total": n, "correct": correct, "pct": pct})
+        stats[dataset_key] = arr
+        # Randomize question order and, within each, the option order
+        # First build option-shuffled questions
+        opt_shuffled: List[Dict[str, Any]] = []
+        for q in quiz_data.get("questions", []):
+            opts = list(q.get("options", []))
+            order = list(range(len(opts)))
+            random.shuffle(order)
+            new_opts = [opts[i] for i in order]
+            correct_set = set(q.get("correct", []) or [])
+            new_correct = [j for j, old_i in enumerate(order) if old_i in correct_set]
+            opt_shuffled.append({"q": q.get("q", ""), "options": new_opts, "correct": new_correct})
+        # Then shuffle the question order
+        shuffled_questions = list(opt_shuffled)
+        random.shuffle(shuffled_questions)
+
+        # Preserve title and hash to keep dataset identity
+        new_quiz_data = dict(quiz_data)
+        new_quiz_data["questions"] = shuffled_questions
+
+        if isinstance(selected_id, str) and selected_id.startswith("file:"):
+            current_path = selected_id.split(":", 1)[1]
+            try:
+                dataset_to_csv(new_quiz_data, current_path, selected_map={})
+            except Exception:
+                pass
+        new_state = default_state(new_quiz_data.get("hash"))
+        fb = html.Div([
+            html.Div("Attempt submitted.", className="fw-semibold"),
+            html.Small(f"Score: {pct}%", className="text-muted")
+        ], className="alert alert-info")
+        return new_state, stats, fb, new_quiz_data
+
+    # Not finished: persist partial progress directly into dataset CSV's Selected column
+    if isinstance(selected_id, str) and selected_id.startswith("file:"):
+        current_path = selected_id.split(":", 1)[1]
+        try:
+            # Build selected_map from new_state
+            sel_map: Dict[int, List[int]] = {}
+            for k, v in (new_state.get("answers", {}) or {}).items():
+                try:
+                    i = int(k)
+                except Exception:
+                    continue
+                sel_map[i] = list(v.get("selected", []))
+            dataset_to_csv(quiz_data, current_path, selected_map=sel_map)
+        except Exception:
+            pass
+    # Return without changing quiz_data
+    return new_state, no_update, fb, no_update
 
 
 @callback(
@@ -991,7 +1165,7 @@ def render_progress_plot(stats, quiz_data):
         "layout": {
             "paper_bgcolor": "rgba(0,0,0,0)",
             "plot_bgcolor": "rgba(0,0,0,0)",
-            "xaxis": {"title": "Attempt", "gridcolor": "rgba(255,255,255,.08)", "tickfont": {"color": "#e5e7eb"}, "titlefont": {"color": "#e5e7eb"}},
+            "xaxis": {"title": "Attempt", "gridcolor": "rgba(255,255,255,.08)", "tickfont": {"color": "#e5e7eb"}, "titlefont": {"color": "#e5e7eb"}, "tickmode": "linear", "dtick": 1},
             "yaxis": {"title": "% correct", "range": [0, 100], "gridcolor": "rgba(255,255,255,.08)", "tickfont": {"color": "#e5e7eb"}, "titlefont": {"color": "#e5e7eb"}},
             "font": {"color": "#e5e7eb"},
             "margin": {"l": 50, "r": 20, "t": 10, "b": 40},
@@ -1001,20 +1175,223 @@ def render_progress_plot(stats, quiz_data):
 
 
 @callback(
+    Output("quiz_data", "data", allow_duplicate=True),
+    Output("quiz_state", "data", allow_duplicate=True),
+    Output("feedback", "children", allow_duplicate=True),
+    Input("btn_shuffle_options", "n_clicks"),
+    State("quiz_data", "data"),
+    State("quiz_state", "data"),
+    State("selected_dataset", "data"),
+    prevent_initial_call=True,
+)
+def on_shuffle_options(nc, quiz_data, state, selected_id):
+    if not nc or not quiz_data:
+        raise PreventUpdate
+    qs = quiz_data.get("questions", [])
+    # Shuffle options within each question, keep question order
+    opt_maps: Dict[int, Dict[int, int]] = {}
+    new_questions: List[Dict[str, Any]] = []
+    for i, q in enumerate(qs):
+        opts = list(q.get("options", []))
+        order = list(range(len(opts)))
+        random.shuffle(order)
+        new_opts = [opts[k] for k in order]
+        idx_map = {old: new for new, old in enumerate(order)}
+        opt_maps[i] = idx_map
+        corr_set = set(q.get("correct", []) or [])
+        new_corr = [idx_map[c] for c in corr_set if c in idx_map]
+        new_questions.append({"q": q.get("q", ""), "options": new_opts, "correct": new_corr})
+
+    # Remap answers only within questions
+    answers = (state or {}).get("answers", {}) if state else {}
+    new_answers: Dict[str, Any] = {}
+    for k, rec in (answers or {}).items():
+        try:
+            qi = int(k)
+        except Exception:
+            continue
+        if qi < 0 or qi >= len(new_questions):
+            continue
+        sel = list(rec.get("selected", [])) if isinstance(rec, dict) else []
+        idx_map = opt_maps.get(qi, {})
+        mapped_sel = [idx_map[s] for s in sel if s in idx_map]
+        # Preserve prior correctness flag; do not auto-grade on shuffle
+        prev_flag = rec.get("correct") if isinstance(rec, dict) else None
+        new_answers[str(qi)] = {"selected": mapped_sel, "correct": prev_flag}
+
+    new_quiz_data = dict(quiz_data)
+    new_quiz_data["questions"] = new_questions
+
+    # Persist to CSV with mapped selections
+    if isinstance(selected_id, str) and selected_id.startswith("file:"):
+        current_path = selected_id.split(":", 1)[1]
+        try:
+            sel_map: Dict[int, List[int]] = {}
+            for sk, rv in new_answers.items():
+                try:
+                    i = int(sk)
+                except Exception:
+                    continue
+                sel_map[i] = list(rv.get("selected", []))
+            dataset_to_csv(new_quiz_data, current_path, selected_map=sel_map)
+        except Exception:
+            pass
+
+    new_state = dict(state or {})
+    new_state["answers"] = new_answers
+    msg = html.Div("Alternativ slumpade (svar bevarade).", className="alert alert-info")
+    return new_quiz_data, new_state, msg
+
+@callback(
+    Output("quiz_data", "data", allow_duplicate=True),
+    Output("quiz_state", "data", allow_duplicate=True),
+    Output("feedback", "children", allow_duplicate=True),
+    Input("btn_shuffle_questions", "n_clicks"),
+    State("quiz_data", "data"),
+    State("quiz_state", "data"),
+    State("selected_dataset", "data"),
+    prevent_initial_call=True,
+)
+def on_shuffle_questions(nc, quiz_data, state, selected_id):
+    if not nc or not quiz_data:
+        raise PreventUpdate
+    qs = quiz_data.get("questions", [])
+    n = len(qs)
+    # Shuffle question order only
+    q_order = list(range(n))
+    random.shuffle(q_order)
+    inv_q_order = {old_i: new_i for new_i, old_i in enumerate(q_order)}
+    new_questions = [qs[old_i] for old_i in q_order]
+
+    # Remap answers to new question indices (options unchanged)
+    answers = (state or {}).get("answers", {}) if state else {}
+    new_answers: Dict[str, Any] = {}
+    for k, rec in (answers or {}).items():
+        try:
+            old_q = int(k)
+        except Exception:
+            continue
+        if old_q < 0 or old_q >= n:
+            continue
+        new_q = inv_q_order.get(old_q)
+        if new_q is None:
+            continue
+        sel = list(rec.get("selected", [])) if isinstance(rec, dict) else []
+        # Preserve prior correctness flag; do not auto-grade on shuffle
+        prev_flag = rec.get("correct") if isinstance(rec, dict) else None
+        new_answers[str(new_q)] = {"selected": sel, "correct": prev_flag}
+
+    # Map current pointer
+    old_current = (state or {}).get("current", 0) if state else 0
+    new_current = inv_q_order.get(int(old_current), 0)
+    if new_current is None:
+        new_current = 0
+
+    new_quiz_data = dict(quiz_data)
+    new_quiz_data["questions"] = new_questions
+
+    # Persist to CSV
+    if isinstance(selected_id, str) and selected_id.startswith("file:"):
+        current_path = selected_id.split(":", 1)[1]
+        try:
+            sel_map: Dict[int, List[int]] = {}
+            for sk, rv in new_answers.items():
+                try:
+                    i = int(sk)
+                except Exception:
+                    continue
+                sel_map[i] = list(rv.get("selected", []))
+            dataset_to_csv(new_quiz_data, current_path, selected_map=sel_map)
+        except Exception:
+            pass
+
+    new_state = dict(state or {})
+    new_state["answers"] = new_answers
+    new_state["current"] = new_current
+    msg = html.Div("Frågor slumpade (svar bevarade).", className="alert alert-info")
+    return new_quiz_data, new_state, msg
+
+@callback(
+    Output("quiz_state", "data", allow_duplicate=True),
+    Input("answer_input", "value"),
+    State("quiz_state", "data"),
+    State("quiz_data", "data"),
+    State("selected_dataset", "data"),
+    prevent_initial_call=True,
+)
+def on_answer_change(selected, state, quiz_data, selected_id):
+    # Persist selection immediately on change (no grading)
+    if not state or not quiz_data:
+        raise PreventUpdate
+    idx = int(state.get("current", 0))
+    new_state = dict(state)
+    answers = dict(new_state.get("answers", {}))
+    if selected is None:
+        # If cleared, store empty selection
+        chosen: List[int] = []
+    else:
+        chosen = [selected] if isinstance(selected, int) else sorted(list(set(selected)))
+    prev = answers.get(str(idx), {})
+    answers[str(idx)] = {"selected": chosen, "correct": prev.get("correct")}
+    new_state["answers"] = answers
+    # Write to dataset CSV if a file is selected
+    if isinstance(selected_id, str) and selected_id.startswith("file:"):
+        current_path = selected_id.split(":", 1)[1]
+        try:
+            sel_map: Dict[int, List[int]] = {}
+            for k, v in (new_state.get("answers", {}) or {}).items():
+                try:
+                    i = int(k)
+                except Exception:
+                    continue
+                sel_map[i] = list(v.get("selected", []))
+            dataset_to_csv(quiz_data, current_path, selected_map=sel_map)
+        except Exception:
+            pass
+    return new_state
+
+
+## Removed: separate Finish Attempt handler (Submit handles finish when all questions are answered)
+
+
+@callback(
     Output("quiz_state", "data", allow_duplicate=True),
     Input("btn_next", "n_clicks"),
     State("quiz_state", "data"),
     State("quiz_data", "data"),
+    State("answer_input", "value"),
+    State("selected_dataset", "data"),
     prevent_initial_call=True,
 )
-def on_next(n_clicks, state, quiz_data):
+def on_next(n_clicks, state, quiz_data, selected, selected_id):
     if not state or not quiz_data:
         return no_update
     idx = int(state.get("current", 0))
     n = len(quiz_data["questions"])
-    idx = min(n - 1, idx + 1)
+    # Save current selection (without grading) before moving on
     new_state = dict(state)
-    new_state["current"] = idx
+    answers = dict(new_state.get("answers", {}))
+    if selected is not None:
+        chosen = [selected] if isinstance(selected, int) else sorted(list(set(selected)))
+        prev = answers.get(str(idx), {})
+        answers[str(idx)] = {"selected": chosen, "correct": prev.get("correct")}
+        new_state["answers"] = answers
+        # Persist to dataset CSV
+        if isinstance(selected_id, str) and selected_id.startswith("file:"):
+            current_path = selected_id.split(":", 1)[1]
+            try:
+                sel_map: Dict[int, List[int]] = {}
+                for k, v in (new_state.get("answers", {}) or {}).items():
+                    try:
+                        i = int(k)
+                    except Exception:
+                        continue
+                    sel_map[i] = list(v.get("selected", []))
+                dataset_to_csv(quiz_data, current_path, selected_map=sel_map)
+            except Exception:
+                pass
+    idx2 = min(n - 1, idx + 1)
+    new_state["current"] = idx2
     return new_state
 
 
@@ -1022,15 +1399,38 @@ def on_next(n_clicks, state, quiz_data):
     Output("quiz_state", "data", allow_duplicate=True),
     Input("btn_prev", "n_clicks"),
     State("quiz_state", "data"),
+    State("quiz_data", "data"),
+    State("answer_input", "value"),
+    State("selected_dataset", "data"),
     prevent_initial_call=True,
 )
-def on_prev(n_clicks, state):
+def on_prev(n_clicks, state, quiz_data, selected, selected_id):
     if not state:
         return no_update
     idx = int(state.get("current", 0))
-    idx = max(0, idx - 1)
+    # Save current selection (without grading) before moving
     new_state = dict(state)
-    new_state["current"] = idx
+    answers = dict(new_state.get("answers", {}))
+    if selected is not None:
+        chosen = [selected] if isinstance(selected, int) else sorted(list(set(selected)))
+        prev = answers.get(str(idx), {})
+        answers[str(idx)] = {"selected": chosen, "correct": prev.get("correct")}
+        new_state["answers"] = answers
+        if isinstance(selected_id, str) and selected_id.startswith("file:"):
+            current_path = selected_id.split(":", 1)[1]
+            try:
+                sel_map: Dict[int, List[int]] = {}
+                for k, v in (new_state.get("answers", {}) or {}).items():
+                    try:
+                        i = int(k)
+                    except Exception:
+                        continue
+                    sel_map[i] = list(v.get("selected", []))
+                dataset_to_csv(quiz_data, current_path, selected_map=sel_map)
+            except Exception:
+                pass
+    idx2 = max(0, idx - 1)
+    new_state["current"] = idx2
     return new_state
 
 
@@ -1039,11 +1439,19 @@ def on_prev(n_clicks, state):
     Output("feedback", "children", allow_duplicate=True),
     Input("btn_reset", "n_clicks"),
     State("quiz_data", "data"),
+    State("selected_dataset", "data"),
     prevent_initial_call=True,
 )
-def on_reset(n_clicks, quiz_data):
+def on_reset(n_clicks, quiz_data, selected_id):
     if not quiz_data:
         return no_update, no_update
+    # Clear selected in file when restarting
+    if isinstance(selected_id, str) and selected_id.startswith("file:"):
+        current_path = selected_id.split(":", 1)[1]
+        try:
+            dataset_to_csv(quiz_data, current_path, selected_map={})
+        except Exception:
+            pass
     return default_state(quiz_data.get("hash")), html.Div()
 
 
@@ -1122,20 +1530,23 @@ def editor_sync_choices(opt_text, current_values):
     Output("edit_q_select", "disabled", allow_duplicate=True),
     Output("edit_q_text", "disabled", allow_duplicate=True),
     Output("edit_options_text", "disabled", allow_duplicate=True),
-    Output("edit_correct_choices", "disabled", allow_duplicate=True),
+    Output("edit_correct_choices", "style", allow_duplicate=True),
     Output("btn_add_question", "disabled", allow_duplicate=True),
     Output("btn_delete_question", "disabled", allow_duplicate=True),
     Output("editor_status", "children", allow_duplicate=True),
     Input("selected_dataset", "data"),
-    prevent_initial_call=False,
+    Input("new_dataset_mode", "data"),
+    prevent_initial_call="initial_duplicate",
 )
-def gate_editor_controls(selected_id):
+def gate_editor_controls(selected_id, new_mode):
     has_dataset = isinstance(selected_id, str) and selected_id.startswith("file:")
-    disabled = not has_dataset
+    allow = has_dataset or bool(new_mode)
+    disabled = not allow
     msg = no_update
     if disabled:
-        msg = html.Div("Create a dataset (enter title and click Create Dataset) to start editing.", className="text-info")
-    return disabled, disabled, disabled, disabled, disabled, disabled, msg
+        msg = html.Div("Click 'Create New Dataset' and enter a title to start editing.", className="text-info")
+    checklist_style = {"pointerEvents": "none", "opacity": 0.6} if disabled else {}
+    return disabled, disabled, disabled, checklist_style, disabled, disabled, msg
 
 
 @callback(
@@ -1147,12 +1558,16 @@ def gate_editor_controls(selected_id):
     Input("edit_correct_choices", "value"),
     State("quiz_data", "data"),
     State("selected_dataset", "data"),
+    State("new_dataset_mode", "data"),
     prevent_initial_call=True,
 )
-def editor_live_update(title, sel_idx, qtext, opt_text, correct_vals, quiz_data, selected_id):
+def editor_live_update(title, sel_idx, qtext, opt_text, correct_vals, quiz_data, selected_id, new_mode):
     # Build updated dataset live as user edits
-    # Only allow live edits when a file-backed dataset exists
-    if not quiz_data or not (isinstance(selected_id, str) and selected_id.startswith("file:")):
+    # Allow live edits if file-backed OR we're in new-dataset mode (no autosave until created)
+    if not quiz_data:
+        raise PreventUpdate
+    allow_edit = (isinstance(selected_id, str) and selected_id.startswith("file:")) or bool(new_mode)
+    if not allow_edit:
         raise PreventUpdate
     current_title = quiz_data.get("title", "")
     qs = list(quiz_data.get("questions", []))
@@ -1180,6 +1595,46 @@ def editor_live_update(title, sel_idx, qtext, opt_text, correct_vals, quiz_data,
     qs[sel_idx] = {"q": new_q, "options": new_options, "correct": new_correct}
     new_data = dataset_from_questions(qs, new_title)
     return new_data
+
+
+@callback(
+    Output("datasets_list", "data", allow_duplicate=True),
+    Output("dataset_select", "options", allow_duplicate=True),
+    Output("dataset_select", "value", allow_duplicate=True),
+    Output("csv_load_status", "children", allow_duplicate=True),
+    Output("selected_dataset", "data", allow_duplicate=True),
+    Output("editor_status", "children", allow_duplicate=True),
+    Output("new_dataset_mode", "data", allow_duplicate=True),
+    Input("edit_title", "value"),
+    State("quiz_data", "data"),
+    State("new_dataset_mode", "data"),
+    prevent_initial_call=True,
+)
+def create_file_when_titled(title, quiz_data, new_mode):
+    # Create underlying CSV when in new-dataset mode and a non-empty title is provided
+    title = (title or "").strip()
+    if not new_mode or not title or not quiz_data:
+        raise PreventUpdate
+    ensure_csv_dir()
+    path = _unique_csv_path_for_title(title)
+    try:
+        # ensure dataset carries the title
+        working = dict(quiz_data)
+        working["title"] = title
+        dataset_to_csv(working, path)
+    except Exception as e:
+        return no_update, no_update, no_update, html.Small(f"Kunde inte spara: {e}", className="text-danger"), no_update, no_update, no_update
+    # Reload folder and select new file
+    datasets = load_all_csv_datasets()
+    entries = []
+    for d in datasets:
+        fid = f"file:{os.path.abspath(d.get('source_path'))}"
+        t2 = d.get("title") or os.path.splitext(os.path.basename(d.get("source_path", "")))[0]
+        entries.append({"id": fid, "title": t2, "data": d})
+    options = [{"label": e["title"], "value": e["id"]} for e in entries]
+    chosen_id = f"file:{os.path.abspath(path)}"
+    status = html.Small(f"Skapade csv/{os.path.basename(path)}", className="text-muted")
+    return entries, options, chosen_id, status, chosen_id, html.Div("Dataset created.", className="text-success"), False
 
 
 @callback(
