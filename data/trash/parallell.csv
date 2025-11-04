@@ -1,0 +1,43 @@
+﻿Question;Options;Correct;Selected
+För att säkerställa att alla trådar har passerat en viss kod-rad innan de går vidare, används i CUDA funktionen __syncthreads() som är en form av ______ ?;ii. Barrier.|iv. Cache.|i. Buffer.|iii. Memory.;ii. Barrier.;
+"För att stödja system av heterogena maskiner så har MPI stöd för _______ i
+mjukvarubiblioteket och i körningsmiljön (eng. run-time environment) ?";iv. Message routing.|iii. Object-relational mapping.|i. Database migration.|ii. Data marshaling.;ii. Data marshaling.;
+En ogenomtänkt användning av delat minne (eng. Shared Memory) kan leda till problemet Race Condition som kan medföra att  _____ ?;Det multi-trådade programmet går betydligt långsammare än nödvändigt.|Alla trådar i programmet kraschar samtidigt vid åtkomst av delat minne.|Det kan uppstå korrupt data i slumpmässiga adresser i det delade minnet.|Parallell uppdatering av delad data blir inte korrekt så som det var tänkt.;Parallell uppdatering av delad data blir inte korrekt så som det var tänkt.;
+"Flera av funktionerna inom standarden MPI används ofta parvis som exempelvis
+_______?";i. MPI_Send() och MPI_Recv().|iv. MPI_Bcast() och MPI_Reduce().|iii. MPI_Load() och MPI_Store().|ii. MPI_Bind() och MPI_Listen().;i. MPI_Send() och MPI_Recv().;
+"Studera följande givna C#-program. Svara kortfattat på var och en av frågorna med ett
+av de givna alternativen, och ange specifikt värde där det efterfrågas.
+
+(b) Vilket värde har counter efter en parallell exekvering av funktionen count med
+tio trådar?
+ static volatile int counter = 0;
+ static void count()
+ {
+ for (int j = 0; j < 10; j++)
+ {
+ counter = counter + 1;
+ }
+ }";iv. Odefinierat värde|ii. Oftast, men inte alltid värdet <ange värde>|i. Alltid värdet <ange värde>|iii. Okänt i förväg, men maximalt värdet <ange värde>;;
+Loop-strukturer kan parallelliseras med hjälp av metoderna _____ inom namnrymden (eng. Namespace) System.Thread.Tasks ?;i. Parallel.For|ii. Parallel.ForEach|iii. Parallel.Repeat|iv. Parallel.While;i. Parallel.For|ii. Parallel.ForEach;
+Lås (eng. Mutual Exclusion) inbegriper och är nära relaterat till olika fenomen och begrepp som exempelvis  _______ ?;iv. Race Condition.|ii. Embarrising Parallelism.|iii. Deadlock.|i. High Processor Utilization.;iv. Race Condition.|iii. Deadlock.;
+Metoderna inom klassen Monitor inom namnrymden (eng. Namespace) System.Threading, används ofta tillsammans parvis som exempelvis _______ ?;iv. Monitor.Lock och Monitor.UnLock.|i. Monitor.Enter och Monitor.Exit.|ii. Monitor.Wait och Monitor.PulseAll.|iii. Monitor.Enter och Monitor.Pulse.;i. Monitor.Enter och Monitor.Exit.|ii. Monitor.Wait och Monitor.PulseAll.;
+"För att få reda på antalet processer som är sammankopplade inom ett nätverk som
+använder ramverket MPI, så används funktionen ____?";iii. MPI_Comm_rank().|i. MPI_Group_processes().|ii. MPI_Comm_size().|iv. MPI_Network_size().;ii. MPI_Comm_size().;
+I normalfallet så behöver en körning av en kernel förberedas i OpenCL genom  ______ , som görs explicit i run-time i huvudprogrammet ?;iv. Uppvärmning av berörda beräkningskärnor (eng. Cores).|i. Kompilering av källkod|ii. Överföring av binärkod från Host till Device|iii. Kopiering av data från Host till Device;i. Kompilering av källkod|iii. Kopiering av data från Host till Device;
+Förutom att en abstrakt datatyp är trådsäker förväntas vanligtvis att den delade datastrukturen har egenskapen _______ sett till operationernas semantik?;iv. Concurrency.|ii. Sequenceability.|i. Linearizability.|iii. Consistency.;i. Linearizability.;
+Eftersom olika grafikkort kan ha olika arkitekturer och även andra egenskaper som skiljer dem emellan, så har CUDA indelat egenskaperna i grupper kallad ______ ?;iii. Parallel Capability.|i. Processing Power.|iv. NVidia Power.|ii. Compute Capability.;ii. Compute Capability.;
+Mekanismer för konstruktion av lås (eng. Mutual Exclusion) kan implementeras med hjälp av _______ ?;ii. Läsande och skrivande till ett antal delade variabler.|iv. Flaggor och semaforer (eng. Semaphores).|i. Skickande och mottagande av meddelanden (eng. Messsage Passing).|iii. Atomiska instruktioner (eng. Atomic Operations).;iii. Atomiska instruktioner (eng. Atomic Operations).;
+För att inte begränsa den möjliga prestandan och skalbarheten för parallella program, är det viktigt att försöka minska antalet _______ ?;i. Läsningar till spridda adresser på delat minne.|iv. Skrivningar till spridda adresser på delat minne.|ii. Atomiska instruktioner (eng. Atomic Operations).|iii. Operationer som använder lokalt minne.;i. Läsningar till spridda adresser på delat minne.|iv. Skrivningar till spridda adresser på delat minne.|ii. Atomiska instruktioner (eng. Atomic Operations).;
+"Kommunikation med ramverket MPI kan ske med olika lägen (eng. modes) som
+exempelvis _______?";i. Locally blocking.|iv. High-performance.|ii. Globally blocking.|iii. Non-blocking.;iii. Non-blocking.;
+En GPU (Graphics Processing Unit) lämpar sig bäst för utförandet av program och beräkningar med egenskapen/-erna ____ ?;i. Task Parallelism.|iii. Data Parallelism.|iv. Synchronization-Heavy.|ii. Distributed Parallelism.;iii. Data Parallelism.;
+Respektive arbetsenhets (eng. Work Item) unika ID sett till hela sessionen med arbetsenheter, fås fram genom den interna funktionen (eng. Intrinsic) _____ ?;iii. get_total_id()|ii. get_global_id()|i. get_local_id()|iv. get_thread_id();ii. get_global_id();
+De olika principer för parallell programmering som stöds av ramverket Task Parallel Library (TPL) är _____ ?;i. Embarrasing Parallelism.|iv. Data Parallelism.|ii. Distributed Parallelism.|iii. Task Parallelism.;iv. Data Parallelism.|iii. Task Parallelism.;
+"Om man vill reducera sin datamängd genom att exempelvis addera ett antal värden
+till en summa, så kan funktionen ____ i ramverket MPI användas?";i. MPI_Reduction().|iv. MPI_Add().|iii. MPI_Summarize().|ii. MPI_Reduce().;ii. MPI_Reduce().;
+Begreppet ______ är relaterade till lokala system som använder fler än en typ av processorer eller processorkärnor som kan exekveras parallellt?;i. Distributed Computing.|iv. Patogeneous Computing.|ii. Homogeneous Computing.|iii. Heterogeneous Computing.;iii. Heterogeneous Computing.;
+Minnestyperna ________ ingår som användbara inom ramverket OpenCL ?;ii. Private memory|iv. Local memory|i. Public memory|iii. Global memory;ii. Private memory|iv. Local memory|iii. Global memory;
+En specifik körande instans av en kernel som har startats på GPU med CUDA, kan ta reda på vilken global identitet som instansen har genom uttrycket  _____ ?;iii. blockIdx.x + threadIdx.x * threadDim.x|ii. threadIdx.x + blockIdx.x * gridDim.x|i. threadIdx.x + blockIdx.x * blockDim.x|iv. blockIdx.x + threadIdx.x * gridDim.x;i. threadIdx.x + blockIdx.x * blockDim.x;
+Trådar som exekveras inom ramverket CUDA har möjligheten/-erna att kunna ______ som inte är möjligt för vanliga parallella block?;ii. Kommunicera inbördes.|iv. Synkronisera inbördes.|iii. Använda matematiska operationer.|i. Modifiera innehåll i minne.;ii. Kommunicera inbördes.|iv. Synkronisera inbördes.;
+Non-Blocking Synchronization är en kategori av egenskaper och mekanismer för synkronisering, och kan delas in i underkategorierna _____ ?;iv. Semaphore Synchronization.|i. Lock-Free Synchronization.|ii. Mutual-Exclusion Synchronization.|iii. Wait-Free Synchronization.;i. Lock-Free Synchronization.|iii. Wait-Free Synchronization.;
+En huvudanledning till att det är nödvändigt att parallellisera program för att de skall kunna exekveras allt snabbare i framtiden är att  _____ ?;De enskilda trådarnas minne annars inte räcker till hela programmet.|Antalet transistorer i en enskild mikroprocessor ökar med tiden.|Strömförbrukningen ökar dramatiskt med högre klockfrekvenser.|Processorernas kärnor blir inte signifikant mycket snabbare längre.;Strömförbrukningen ökar dramatiskt med högre klockfrekvenser.|Processorernas kärnor blir inte signifikant mycket snabbare längre.;

@@ -1,34 +1,38 @@
-import base64
+import os
 import io
 import json
 import hashlib
-import os
 import random
+import re
+import base64
 from datetime import datetime
 from typing import List, Dict, Any, Tuple
 
 import pandas as pd
-from dash import Dash, dcc, html, callback, Output, Input, State, ctx, no_update
+from dash import Dash, dcc, html, Input, Output, State, no_update, callback
 from dash.exceptions import PreventUpdate
 
-# External dark theme (Bootswatch Darkly)
+# External styles: Bootswatch Darkly and optional icons
 EXTERNAL_STYLESHEETS = [
-    "https://cdn.jsdelivr.net/npm/bootswatch@5.3.3/dist/darkly/bootstrap.min.css",
+    "https://cdn.jsdelivr.net/npm/bootswatch@5.3.2/dist/darkly/bootstrap.min.css",
+    "https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css",
 ]
 
 
-
 def normalize_token(s: str) -> str:
-    return (s or "").strip().lower()
+    """Normalize a token for comparison: lowercase, collapse whitespace, strip."""
+    if s is None:
+        return ""
+    return re.sub(r"\s+", " ", str(s)).strip().lower()
 
 
-def detect_token_list(text: str) -> List[str]:
-    """Split a cell into tokens using common separators (priority order)."""
-    if text is None:
+def detect_token_list(s: str) -> List[str]:
+    """Split an options/correct cell into a list of unique tokens in original order.
+    Tries separators in priority order: '|' > newline > ';' (if no commas) > '/' > ','.
+    """
+    if s is None:
         return []
-    s = str(text).strip().replace("\r", "")
-    if not s:
-        return []
+    s = str(s)
     # Priority: pipe |, newline, semicolon within cell (Excel), slash, comma
     if "|" in s:
         parts = [p.strip() for p in s.split("|")]
@@ -49,6 +53,52 @@ def detect_token_list(text: str) -> List[str]:
             uniq.append(p)
             seen.add(k)
     return uniq
+@callback(
+    Output("progress_plot", "figure", allow_duplicate=True),
+    Input("quiz_stats", "data"),
+    Input("plot_metric", "value"),
+    State("quiz_data", "data"),
+    prevent_initial_call=True,
+)
+def render_progress_plot(stats, metric, quiz_data):
+    # Render attempts for current dataset hash
+    def empty_fig(y_title: str):
+        return {"data": [], "layout": {"paper_bgcolor": "rgba(0,0,0,0)", "plot_bgcolor": "rgba(0,0,0,0)", "xaxis": {"title": "Attempt"}, "yaxis": {"title": y_title}}}
+
+    if not quiz_data:
+        return empty_fig("% korrekt" if (metric or "pct") == "pct" else "Poäng")
+    dataset_key = quiz_data.get("hash")
+    series = (stats or {}).get(dataset_key, [])
+    if not series:
+        return empty_fig("% korrekt" if (metric or "pct") == "pct" else "Poäng")
+    x = list(range(1, len(series) + 1))
+    total = len(quiz_data.get("questions", []) or [])
+    if (metric or "pct") == "points":
+        # Prefer stored points; fallback to pct*total/100
+        y = [
+            (pt.get("points") if pt.get("points") is not None else round((pt.get("pct", 0) * (pt.get("total", total) or total) / 100.0), 2))
+            for pt in series
+        ]
+        y_title = "Poäng"
+        y_range = [0, total or (max(y) if y else 1)]
+    else:
+        y = [pt.get("pct", 0) for pt in series]
+        y_title = "% korrekt"
+        y_range = [0, 100]
+    fig = {
+        "data": [
+            {"type": "scatter", "mode": "lines+markers", "x": x, "y": y, "line": {"color": "#6f9eff"}, "marker": {"color": "#6f9eff"}},
+        ],
+        "layout": {
+            "paper_bgcolor": "rgba(0,0,0,0)",
+            "plot_bgcolor": "rgba(0,0,0,0)",
+            "xaxis": {"title": "Attempt", "gridcolor": "rgba(255,255,255,.08)", "tickfont": {"color": "#e5e7eb"}, "titlefont": {"color": "#e5e7eb"}, "tickmode": "linear", "dtick": 1},
+            "yaxis": {"title": y_title, "range": y_range, "gridcolor": "rgba(255,255,255,.08)", "tickfont": {"color": "#e5e7eb"}, "titlefont": {"color": "#e5e7eb"}},
+            "font": {"color": "#e5e7eb"},
+            "margin": {"l": 50, "r": 20, "t": 10, "b": 40},
+        },
+    }
+    return fig
 
 
 def parse_correct_indices(options: List[str], correct_cell: str) -> List[int]:
@@ -112,10 +162,18 @@ def parse_dataframe(df: pd.DataFrame) -> Dict[str, Any]:
     prefill_selected: List[List[int]] = []
     for _, row in df.iterrows():
         q_raw = str(row["Question"]).strip()
-        opts = detect_token_list(row["Options"])  # split into list
-        if not q_raw or not opts:
-            # skip incomplete rows
+        raw_opts_cell = row["Options"]
+        opts = detect_token_list(raw_opts_cell)  # split into list
+        if not q_raw:
+            # skip rows without a question
             continue
+        if not opts:
+            # Fallback: if there is some text in the Options cell but our splitter failed, keep it as a single option
+            if str(raw_opts_cell).strip():
+                opts = [str(raw_opts_cell).strip()]
+            else:
+                # truly empty options -> skip
+                continue
         correct_idx = parse_correct_indices(opts, row["Correct"])  # list of ints
         questions.append({
             "q": q_raw,
@@ -154,6 +212,7 @@ def default_state(dataset_hash: str) -> Dict[str, Any]:
         "dataset_hash": dataset_hash,
         "current": 0,
         "answers": {},
+        "review": False,
         "created_at": datetime.utcnow().isoformat() + "Z",
     }
 
@@ -305,19 +364,39 @@ app.index_string = (
     "</html>\n"
 )
 
-# ---------- CSV directory helpers ----------
+# ---------- Data directory helpers ----------
 
-CSV_DIR = os.path.join(os.path.dirname(__file__), "csv")
+CSV_DIR = os.path.join(os.path.dirname(__file__), "data")
 TRASH_DIR = os.path.join(CSV_DIR, "trash")
 PROGRESS_SUFFIX = ".progress.csv"
 
 
 def ensure_csv_dir() -> str:
+    """Ensure app data directory exists; migrate legacy 'csv' folder contents into 'data' if present."""
+    base_dir = os.path.dirname(__file__)
+    data_dir = CSV_DIR
+    legacy_dir = os.path.join(base_dir, "csv")
     try:
-        os.makedirs(CSV_DIR, exist_ok=True)
+        os.makedirs(data_dir, exist_ok=True)
+        # Migrate legacy folder contents once
+        if os.path.isdir(legacy_dir):
+            for name in os.listdir(legacy_dir):
+                src = os.path.join(legacy_dir, name)
+                dst = os.path.join(data_dir, name)
+                try:
+                    if not os.path.exists(dst):
+                        os.replace(src, dst)
+                except Exception:
+                    pass
+            # try to remove legacy dir if empty (ignore on failure)
+            try:
+                if not os.listdir(legacy_dir):
+                    os.rmdir(legacy_dir)
+            except Exception:
+                pass
     except Exception:
         pass
-    return CSV_DIR
+    return data_dir
 
 
 def ensure_trash_dir() -> str:
@@ -336,7 +415,7 @@ def slugify_filename(name: str) -> str:
     while "--" in safe:
         safe = safe.replace("--", "-")
     safe = safe.strip("-_") or "quiz"
-    return f"{safe}.csv"
+    return f"{safe}.json"
 
 
 def _unique_path_in_dir(directory: str, basename: str) -> str:
@@ -381,6 +460,37 @@ def dataset_to_csv(dataset: Dict[str, Any], file_path: str, selected_map: Dict[i
     df.to_csv(file_path, index=False, sep=";", encoding="utf-8-sig")
 
 
+def dataset_to_json(dataset: Dict[str, Any], file_path: str, selected_map: Dict[int, List[int]] | None = None) -> None:
+    """Save dataset to a JSON file, keeping selections inside each question as 'selected' indices."""
+    data = {
+        "title": dataset.get("title") or "Quiz",
+        "hash": dataset.get("hash"),
+        "questions": [],
+    }
+    qs = dataset.get("questions", []) or []
+    for idx, q in enumerate(qs):
+        rec = {
+            "q": q.get("q", ""),
+            "options": list(q.get("options", []) or []),
+            "correct": list(q.get("correct", []) or []),
+        }
+        if isinstance(selected_map, dict):
+            sel = selected_map.get(idx, []) or []
+            rec["selected"] = list(sel)
+        data["questions"].append(rec)
+    with open(file_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def dataset_save_autodetect(dataset: Dict[str, Any], file_path: str, selected_map: Dict[int, List[int]] | None = None) -> None:
+    """Save dataset to CSV or JSON depending on file extension."""
+    ext = os.path.splitext(file_path)[1].lower()
+    if ext == ".json":
+        dataset_to_json(dataset, file_path, selected_map=selected_map)
+    else:
+        dataset_to_csv(dataset, file_path, selected_map=selected_map)
+
+
 def _progress_path_for_selected(selected_id: str | None) -> str | None:
     if not (isinstance(selected_id, str) and selected_id.startswith("file:")):
         return None
@@ -395,7 +505,7 @@ def save_progress_to_csv(state: Dict[str, Any] | None, quiz_data: Dict[str, Any]
             return
         path = _progress_path_for_selected(selected_id)
         if not path:
-            return
+                    n = len(quiz_data.get("questions", []) or [])
         n = len(quiz_data.get("questions", []))
         rows: List[Dict[str, Any]] = []
         answers = state.get("answers", {}) if isinstance(state, dict) else {}
@@ -450,23 +560,71 @@ def delete_progress_file(selected_id: str | None) -> None:
         pass
 
 
+def _parse_json_dataset(path: str) -> Dict[str, Any]:
+    with open(path, "r", encoding="utf-8") as f:
+        raw = json.load(f)
+    questions = []
+    prefill: List[List[int]] = []
+    for q in raw.get("questions", []) or []:
+        qtext = str(q.get("q", ""))
+        opts = list(q.get("options", []) or [])
+        corr = list(q.get("correct", []) or [])
+        questions.append({"q": qtext, "options": opts, "correct": corr})
+        sel = list(q.get("selected", []) or [])
+        prefill.append(sel)
+    payload = dataset_from_questions(questions, raw.get("title") or "Quiz")
+    if any(len(s) > 0 for s in prefill):
+        payload["prefill_selected"] = prefill
+    payload["source_path"] = path
+    return payload
+
+
 def load_all_csv_datasets() -> List[Dict[str, Any]]:
     ensure_csv_dir()
     datasets: List[Dict[str, Any]] = []
     try:
         for name in sorted(os.listdir(CSV_DIR)):
-            if not name.lower().endswith(".csv"):
-                continue
+            lower = name.lower()
             path = os.path.join(CSV_DIR, name)
-            try:
-                df = pd.read_csv(path, sep=";", engine="python")
-                data = parse_dataframe(df)
-                data["title"] = os.path.splitext(name)[0]
-                data["source_path"] = path
-                datasets.append(data)
-            except Exception:
-                # skip malformed file
-                continue
+            if lower.endswith(".json"):
+                try:
+                    data = _parse_json_dataset(path)
+                    data["title"] = data.get("title") or os.path.splitext(name)[0]
+                    data["source_path"] = path
+                    datasets.append(data)
+                except Exception:
+                    continue
+            elif lower.endswith(".csv"):
+                # Migrate CSV -> JSON once, then move CSV to trash
+                try:
+                    df = pd.read_csv(path, sep=";", engine="python")
+                    data = parse_dataframe(df)
+                    title = data.get("title") or os.path.splitext(name)[0]
+                    base = os.path.splitext(slugify_filename(title or "quiz"))[0]
+                    target_json = os.path.join(CSV_DIR, f"{base}.json")
+                    if os.path.exists(target_json):
+                        # choose a unique JSON name
+                        target_json = _unique_csv_path_for_title(title)
+                    # Write JSON with any prefilled selections
+                    sel_map: Dict[int, List[int]] = {}
+                    pre = data.get("prefill_selected") or []
+                    for i, sel in enumerate(pre):
+                        sel_map[i] = list(sel or [])
+                    dataset_to_json(data, target_json, selected_map=sel_map)
+                    # Move CSV to trash
+                    try:
+                        ensure_trash_dir()
+                        os.replace(path, os.path.join(TRASH_DIR, name))
+                    except Exception:
+                        pass
+                    # Load the new JSON into list
+                    data2 = _parse_json_dataset(target_json)
+                    data2["title"] = data2.get("title") or os.path.splitext(os.path.basename(target_json))[0]
+                    data2["source_path"] = target_json
+                    datasets.append(data2)
+                except Exception:
+                    # If migration fails, skip this file
+                    continue
     except Exception:
         pass
     return datasets
@@ -478,10 +636,10 @@ app.layout = html.Div(
 
         html.H2("Quiz App", className="mb-3"),
         html.P(
-            "Datasets are auto-loaded from the csv folder. Columns: 1=Question, 2=Options (use | between choices), 3=Correct (text, letters A/B/.. or 1-based indices).",
+            "Datasets (JSON) laddas automatiskt från mappen 'csv'. JSON-formatet är robust och behåller kod och radbrytningar.",
             className="text-muted",
         ),
-        # Auto-loaded datasets from csv folder
+        # Auto-loaded datasets from folder (JSON only)
         html.Div(
             className="card mb-3",
             children=[
@@ -496,7 +654,7 @@ app.layout = html.Div(
                             html.Button("Delete file", id="btn_delete_csv", className="btn btn-outline-danger btn-sm"),
                         ]),
                     ]),
-                    html.Small(f"CSV folder: {os.path.join(os.path.dirname(__file__), 'csv')}", className="text-muted"),
+                    html.Small(f"Data folder: {CSV_DIR}", className="text-muted"),
                     html.Div(id="csv_load_status", className="mt-2 text-muted"),
                 ]),
             ],
@@ -581,13 +739,25 @@ app.layout = html.Div(
                     html.Div(id="question_counter", className="text-muted"),
                 ]),
                 html.Div(className="card-body", children=[
-                    html.H4(id="question_text", className="card-title"),
+                    html.Div(id="question_text", className="card-title"),
                     html.Div(id="answer_container", className="my-3"),
                     html.Div(id="feedback", className="mt-2"),
                 ]),
                 html.Div(className="card-footer d-flex gap-2", children=[
                     html.Button("Prev", id="btn_prev", className="btn btn-secondary"),
                     html.Button("Next", id="btn_next", className="btn btn-secondary"),
+                    dcc.Dropdown(id="quiz_jump_select", options=[], value=None, placeholder="Gå till fråga...", clearable=False, style={"minWidth": "260px", "width": "420px"}),
+                    dcc.Dropdown(
+                        id="scoring_mode",
+                        options=[
+                            {"label": "Poäng: Helt rätt eller fel", "value": "aon"},
+                            {"label": "Poäng: Delvis (utan avdrag)", "value": "partial"},
+                            {"label": "Poäng: Delvis (med avdrag)", "value": "penalty"},
+                        ],
+                        value="aon",
+                        clearable=False,
+                        style={"minWidth": "260px", "width": "300px"},
+                    ),
                     html.Button("Slumpa alternativ", id="btn_shuffle_options", className="btn btn-outline-info btn-sm"),
                     html.Button("Slumpa frågor", id="btn_shuffle_questions", className="btn btn-outline-info btn-sm"),
                     html.Div(className="flex-grow-1"),
@@ -597,9 +767,21 @@ app.layout = html.Div(
             ]),
             # Progress over time plot
             html.Div(className="card", children=[
-                html.Div(className="card-header", children=[html.Div("Your progress over time", className="fw-semibold")]),
+                html.Div(className="card-header d-flex align-items-center justify-content-between", children=[
+                    html.Div("Din utveckling över tid", className="fw-semibold"),
+                    dcc.Dropdown(
+                        id="plot_metric",
+                        options=[
+                            {"label": "% korrekt", "value": "pct"},
+                            {"label": "Poäng", "value": "points"},
+                        ],
+                        value="pct",
+                        clearable=False,
+                        style={"width": "160px"},
+                    ),
+                ]),
                 html.Div(className="card-body", children=[
-                    dcc.Graph(id="progress_plot", figure={"data": [], "layout": {"paper_bgcolor": "rgba(0,0,0,0)", "plot_bgcolor": "rgba(0,0,0,0)", "xaxis": {"title": "Attempt"}, "yaxis": {"title": "% correct", "range": [0, 100]}}})
+                    dcc.Graph(id="progress_plot", figure={"data": [], "layout": {"paper_bgcolor": "rgba(0,0,0,0)", "plot_bgcolor": "rgba(0,0,0,0)", "xaxis": {"title": "Attempt"}, "yaxis": {"title": "% korrekt", "range": [0, 100]}}})
                 ])
             ], style={"marginTop": "12px"}),
         ]),
@@ -614,6 +796,7 @@ app.layout = html.Div(
                     dcc.Input(id="edit_title", type="text", placeholder="Quiz title", className="form-control", style={"maxWidth": "360px"}, value=""),
                     html.Div(className="flex-grow-1"),
                     html.Button("Create New Dataset", id="btn_new_dataset", className="btn btn-outline-warning btn-sm"),
+                    html.Button("Export to Excel", id="btn_export_excel", className="btn btn-outline-info btn-sm"),
                 ]),
                 html.Div(className="card-body", children=[
                     html.Div(className="row g-3", children=[
@@ -657,6 +840,10 @@ app.layout = html.Div(
     dcc.Store(id="new_dataset_mode", data=False, storage_type="session"),
         dcc.Store(id="delete_target"),
         dcc.Store(id="quiz_stats", storage_type="local"),
+        # Auto-clear small flash messages in feedback area
+        dcc.Interval(id="feedback_auto_clear", interval=2500, n_intervals=0, disabled=True),
+        # Download target for exports
+        dcc.Download(id="download_export"),
     ],
 )
 
@@ -672,8 +859,8 @@ app.layout = html.Div(
     State("selected_dataset", "data"),
     prevent_initial_call="initial_duplicate",
 )
-def scan_csv_and_select(nc, selected_id):
-    """Scan csv folder, build options, choose selection (persisting last used), and provide quiz_data."""
+def scan_data_and_select(nc, selected_id):
+    """Scan data folder, build options, choose selection (persisting last used), and provide quiz_data."""
     ensure_csv_dir()
     datasets = load_all_csv_datasets()
     entries = []
@@ -757,13 +944,13 @@ def init_or_retain_state(quiz_data, state, selected_id):
 def _unique_csv_path_for_title(title: str) -> str:
     ensure_csv_dir()
     base = os.path.splitext(slugify_filename(title or "quiz"))[0]
-    candidate = os.path.join(CSV_DIR, f"{base}.csv")
+    candidate = os.path.join(CSV_DIR, f"{base}.json")
     if not os.path.exists(candidate):
         return candidate
     # add numeric suffix
     i = 2
     while True:
-        cand = os.path.join(CSV_DIR, f"{base}-{i}.csv")
+        cand = os.path.join(CSV_DIR, f"{base}-{i}.json")
         if not os.path.exists(cand):
             return cand
         i += 1
@@ -793,18 +980,28 @@ def autosave_on_quiz_data(quiz_data, selected_id, state):
     ensure_csv_dir()
     title = (quiz_data.get("title") or "quiz").strip()
     base = os.path.splitext(slugify_filename(title))[0]
-    desired_path = os.path.join(CSV_DIR, f"{base}.csv")  # non-unique; prefer keeping same name
+    desired_path = os.path.join(CSV_DIR, f"{base}.json")  # default to robust JSON
 
     current_path = selected_id.split(":", 1)[1]
 
-    # If we have a current file, decide whether to rename or overwrite
+    # If we have a current file, decide whether to migrate extension or rename by title
     target_path = desired_path
     renamed = False
+    migrated = False
     if current_path and os.path.exists(current_path):
         current_base = os.path.splitext(os.path.basename(current_path))[0]
         desired_base = os.path.splitext(os.path.basename(desired_path))[0]
         if current_base == desired_base:
-            target_path = current_path
+            # Same base title. If current is CSV, migrate to JSON by writing a new JSON side-by-side.
+            if str(current_path).lower().endswith(".csv"):
+                # choose a free JSON path
+                cand = desired_path
+                if os.path.exists(cand) and os.path.abspath(cand) != os.path.abspath(current_path):
+                    cand = _unique_csv_path_for_title(title)
+                target_path = cand
+                migrated = True
+            else:
+                target_path = current_path
         else:
             # rename; if desired exists and is not current, choose a unique free name
             rename_target = desired_path
@@ -831,7 +1028,7 @@ def autosave_on_quiz_data(quiz_data, selected_id, state):
                 except Exception:
                     continue
                 sel_map[i] = list(v.get("selected", []))
-        dataset_to_csv(quiz_data, target_path, selected_map=sel_map)
+            dataset_save_autodetect(quiz_data, target_path, selected_map=sel_map)
     except Exception:
         # if write fails, do not update lists
         raise PreventUpdate
@@ -839,7 +1036,7 @@ def autosave_on_quiz_data(quiz_data, selected_id, state):
     # Only reload dataset list if we actually renamed the file (title change)
     new_id = f"file:{os.path.abspath(target_path)}"
     editor_msg = html.Div([html.Span("Auto-saved ", className="text-success"), html.Code(os.path.basename(target_path))])
-    if not renamed:
+    if not renamed and not migrated:
         # Avoid reloading list to prevent transient parse races that could clear selection
         return no_update, no_update, no_update, no_update, no_update, editor_msg
 
@@ -850,17 +1047,15 @@ def autosave_on_quiz_data(quiz_data, selected_id, state):
         title2 = d.get("title") or os.path.splitext(os.path.basename(d.get("source_path", "")))[0]
         entries.append({"id": fid, "title": title2, "data": d})
     options = [{"label": e["title"], "value": e["id"]} for e in entries]
-    status = html.Small(f"Auto-saved to csv/{os.path.basename(target_path)} • {len(entries)} file(s)", className="text-muted")
+    status = html.Small(f"Auto-saved to {os.path.basename(target_path)} • {len(entries)} file(s)", className="text-muted")
     return entries, options, new_id, status, new_id, editor_msg
 
 
 def render_answer_inputs(options: List[str], multi: bool, selected: List[int] | None) -> html.Div:
     labels = [f"{chr(ord('A') + i)}. {opt}" for i, opt in enumerate(options)]
     items = [{"label": lbl, "value": i} for i, lbl in enumerate(labels)]
-    if multi:
-        control = dcc.Checklist(id="answer_input", options=items, value=selected or [], inputClassName="form-check-input")
-    else:
-        control = dcc.RadioItems(id="answer_input", options=items, value=(selected[0] if selected else None), inputClassName="form-check-input")
+    # Always allow multi-select in the quiz regardless of number of correct answers
+    control = dcc.Checklist(id="answer_input", options=items, value=selected or [], inputClassName="form-check-input")
     return html.Div(control, className="")
 
 
@@ -873,6 +1068,44 @@ def compute_progress(state: Dict[str, Any], total: int) -> Tuple[int, int]:
         return isinstance(v, dict) and isinstance(v.get("selected"), list) and len(v.get("selected")) > 0
     answered = sum(1 for v in ans.values() if _countable(v))
     return answered, total
+
+
+def render_question_text(qtext: str) -> Any:
+    """Render question text with support for newlines and simple code blocks.
+    If the text contains triple backticks ```...```, segments inside are rendered as a monospace block.
+    Otherwise, preserve newlines with pre-wrap.
+    """
+    if not qtext:
+        return ""
+    s = str(qtext).replace("\r", "")
+    # Simple fence-based split
+    if "```" in s:
+        parts = s.split("```")
+        children: List[Any] = []
+        for i, part in enumerate(parts):
+            if i % 2 == 0:
+                # Normal text segment
+                if part.strip():
+                    children.append(html.Div(part, style={"whiteSpace": "pre-wrap"}))
+            else:
+                code = part.strip("\n")
+                children.append(
+                    html.Pre(
+                        code,
+                        style={
+                            "whiteSpace": "pre-wrap",
+                            "fontFamily": "SFMono-Regular,Consolas,'Liberation Mono',Menlo,monospace",
+                            "backgroundColor": "rgba(255,255,255,.04)",
+                            "border": "1px solid rgba(255,255,255,.12)",
+                            "borderRadius": "8px",
+                            "padding": "10px",
+                            "marginTop": "8px",
+                        },
+                    )
+                )
+        return children if children else html.Div(s, style={"whiteSpace": "pre-wrap"})
+    # No fences: preserve line breaks
+    return html.Div(s, style={"whiteSpace": "pre-wrap"})
 
 
 @callback(
@@ -984,25 +1217,12 @@ def render_quiz(quiz_data, state):
 
     # Pre-select user's previous answer for this question if any
     selected = []
-    feedback = html.Div()
+    # Never update the feedback area here; it's managed by Submit/shuffle/reset callbacks
+    feedback = no_update
     if state:
         ans = state.get("answers", {}).get(str(idx)) or state.get("answers", {}).get(idx)
         if ans:
             selected = ans.get("selected", [])
-            # show feedback if answered
-            if ans.get("correct") is not None:
-                if ans.get("correct"):
-                    feedback = html.Div("Correct!", className="alert alert-success")
-                else:
-                    # show correct answer labels
-                    corr = q.get("correct", [])
-                    labels = ", ".join([f"{chr(ord('A') + i)}" for i in corr])
-                    items = [html.Li(f"{chr(ord('A') + i)}. {q.get('options', [])[i]}") for i in corr if 0 <= i < len(q.get('options', []))]
-                    feedback = html.Div([
-                        html.Div("Incorrect.", className="fw-semibold mb-1"),
-                        html.Small(f"Correct: {labels}", className="text-muted"),
-                        html.Ul(items, className="mt-2"),
-                    ], className="alert alert-warning")
 
     # Progress
     answered, total = compute_progress(state or {}, n)
@@ -1017,7 +1237,7 @@ def render_quiz(quiz_data, state):
     return (
         quiz_data.get("title", "Quiz"),
         f"Question {idx + 1} / {n}",
-        q.get("q", ""),
+        render_question_text(q.get("q", "")),
         render_answer_inputs(q.get("options", []), multi, selected),
         feedback,
         disable_prev,
@@ -1038,6 +1258,98 @@ def evaluate_answer(selected: List[int] | int | None, correct: List[int]) -> Tup
     return chosen, sorted(chosen) == sorted(correct)
 
 
+def score_answer(chosen: List[int], correct: List[int], mode: str) -> Tuple[float, str]:
+    """Return per-question score in [0,1] and a short message.
+    Modes:
+    - aon: 1.0 only if exact match, else 0.0
+    - partial: TP/|Correct| (no penalty)
+    - penalty: max(0, TP - FP)/|Correct|
+    """
+    cset = set(correct or [])
+    sset = set(chosen or [])
+    tp = len(cset & sset)
+    fp = len(sset - cset)
+    denom = max(1, len(cset))
+    if mode == "partial":
+        sc = tp / denom
+    elif mode == "penalty":
+        sc = max(0.0, (tp - fp) / denom)
+    else:  # aon
+        sc = 1.0 if sset == cset else 0.0
+    # Build a compact message
+    if sc >= 1.0:
+        msg = "Rätt!"
+    elif mode == "aon":
+        msg = "Fel."
+    else:
+        msg = f"Delvis rätt: {tp}/{len(cset)}"
+    return float(round(sc, 4)), msg
+
+
+def render_attempt_summary(quiz_data: Dict[str, Any], state: Dict[str, Any], mode: str, show_save: bool = True, saved: bool = False) -> html.Div:
+    qs = quiz_data.get("questions", [])
+    answers = (state or {}).get("answers", {}) or {}
+    rows: List[Any] = []
+    total = len(qs)
+    sum_score = 0.0
+    exact_correct = 0
+    for i, q in enumerate(qs):
+        rec = answers.get(str(i), {}) or {}
+        chosen = rec.get("selected", []) or []
+        c_idx = q.get("correct", []) or []
+        sc, _ = score_answer(chosen, c_idx, mode)
+        sum_score += sc
+        exact = (set(chosen) == set(c_idx))
+        exact_correct += 1 if exact else 0
+        # Labels (letters) and texts
+        def fmt_labels(idxs: List[int]) -> str:
+            return ", ".join([f"{chr(ord('A')+j)}" for j in idxs]) if idxs else "—"
+        chosen_lbl = fmt_labels(chosen)
+        correct_lbl = fmt_labels(c_idx)
+        opts = q.get("options", []) or []
+        def fmt_texts(idxs: List[int]) -> str:
+            parts = []
+            for j in idxs:
+                if isinstance(j, int) and 0 <= j < len(opts):
+                    parts.append(f"{chr(ord('A')+j)}. {opts[j]}")
+            return " | ".join(parts) if parts else "—"
+        correct_txt = fmt_texts(c_idx)
+        chosen_txt = fmt_texts(chosen)
+        status_badge = html.Span("Rätt" if exact else ("Delvis" if sc > 0 else "Fel"),
+                                 className=f"badge {'bg-success' if exact else ('bg-info' if sc>0 else 'bg-warning')} ms-2")
+        rows.append(
+            html.Li([
+                html.Span(f"Q{i+1}"),
+                status_badge,
+                html.Div(q.get("q", ""), className="small text-muted", style={"whiteSpace": "pre-wrap"}),
+                html.Div([
+                    html.Small(f"Dina val: {chosen_lbl}"),
+                    html.Small(f" • Rätt: {correct_lbl}", className="ms-2"),
+                    html.Div(html.Small(f"Rätt svar (text): {correct_txt}"), className="mt-1"),
+                    html.Div(html.Small(f"Dina val (text): {chosen_txt}"), className="mt-1"),
+                    html.Small(f" • Poäng: {int(round(sc*100))}%", className="ms-2" if mode!='aon' else {"display":"none"}),
+                ], className="")
+            ], className="mb-2")
+        )
+    pct = round((sum_score/total)*100, 2) if total else 0.0
+    header = html.Div([
+        html.Div("Resultat", className="fw-semibold mb-1"),
+        html.Small(
+            f"Totalt: {int(round(pct))}%  (läge: {'Helt rätt/fel' if mode=='aon' else ('Delvis utan avdrag' if mode=='partial' else 'Delvis med avdrag')})",
+            className="text-muted"
+        )
+    ])
+    controls: List[Any] = []
+    if show_save and not saved:
+        controls.append(html.Button("Lägg till i grafen", id="btn_save_to_plot", className="btn btn-outline-info btn-sm me-2 mt-2"))
+    if saved:
+        controls.append(html.Span("Tillagd i grafen", className="badge bg-info mt-2 me-2"))
+    # New: allow closing the review without restarting
+    controls.append(html.Button("Stäng resultat", id="btn_close_review", className="btn btn-outline-secondary btn-sm mt-2 me-2"))
+    controls.append(html.Button("Starta ny runda", id="btn_start_new_run", className="btn btn-primary btn-sm mt-2"))
+    return html.Div([header, html.Ul(rows, className="mt-2"), html.Div(controls)], className="alert alert-secondary")
+
+
 ## merged per-question submit into the single Submit callback below
 
 
@@ -1052,9 +1364,10 @@ def evaluate_answer(selected: List[int] | int | None, correct: List[int]) -> Tup
     State("answer_input", "value"),
     State("selected_dataset", "data"),
     State("quiz_stats", "data"),
+    State("scoring_mode", "value"),
     prevent_initial_call=True,
 )
-def on_submit(n_clicks, state, quiz_data, selected, selected_id, stats):
+def on_submit(n_clicks, state, quiz_data, selected, selected_id, stats, scoring_mode):
     if not quiz_data or not state:
         return no_update, no_update, no_update, no_update
     idx = int(state.get("current", 0))
@@ -1063,121 +1376,83 @@ def on_submit(n_clicks, state, quiz_data, selected, selected_id, stats):
 
     new_state = dict(state)
     answers = dict(new_state.get("answers", {}))
-    answers[str(idx)] = {"selected": chosen, "correct": is_correct}
+    # Compute and store per-question score per mode
+    mode = scoring_mode or "aon"
+    qscore, short_msg = score_answer(chosen, q.get("correct", []), mode)
+    answers[str(idx)] = {"selected": chosen, "correct": is_correct, "score": qscore}
     new_state["answers"] = answers
 
-    if is_correct:
-        fb = html.Div("Correct!", className="alert alert-success")
+    # Build feedback depending on mode and correctness
+    if is_correct or qscore >= 1.0:
+        fb = html.Div("Rätt!", className="alert alert-success")
     else:
         corr = q.get("correct", [])
         labels = ", ".join([f"{chr(ord('A') + i)}" for i in corr])
         items = [html.Li(f"{chr(ord('A') + i)}. {q.get('options', [])[i]}") for i in corr if 0 <= i < len(q.get('options', []))]
+        prefix = short_msg if (mode != "aon") else "Fel."
         fb = html.Div([
-            html.Div("Incorrect.", className="fw-semibold mb-1"),
-            html.Small(f"Correct: {labels}", className="text-muted"),
+            html.Div(prefix, className="fw-semibold mb-1"),
+            html.Small(f"Rätt svar: {labels}", className="text-muted"),
             html.Ul(items, className="mt-2"),
         ], className="alert alert-warning")
 
-    # After recording this question, decide whether to finish the attempt
+    # Finish the attempt on submit: grade all questions based on current selections (unanswered -> 0)
     n = len(quiz_data.get("questions", []))
-    completed = all(str(i) in new_state.get("answers", {}) for i in range(n))
-    if completed:
-        # Compute score and log stats
-        correct = sum(1 for i in range(n) if new_state.get("answers", {}).get(str(i), {}).get("correct"))
-        pct = round((correct / n) * 100, 2) if n else 0
-        ts = datetime.utcnow().isoformat() + "Z"
-        stats = stats or {}
-        dataset_key = quiz_data.get("hash")
-        arr = list(stats.get(dataset_key, []))
-        arr.append({"ts": ts, "total": n, "correct": correct, "pct": pct})
-        stats[dataset_key] = arr
-        # Randomize question order and, within each, the option order
-        # First build option-shuffled questions
-        opt_shuffled: List[Dict[str, Any]] = []
-        for q in quiz_data.get("questions", []):
-            opts = list(q.get("options", []))
-            order = list(range(len(opts)))
-            random.shuffle(order)
-            new_opts = [opts[i] for i in order]
-            correct_set = set(q.get("correct", []) or [])
-            new_correct = [j for j, old_i in enumerate(order) if old_i in correct_set]
-            opt_shuffled.append({"q": q.get("q", ""), "options": new_opts, "correct": new_correct})
-        # Then shuffle the question order
-        shuffled_questions = list(opt_shuffled)
-        random.shuffle(shuffled_questions)
-
-        # Preserve title and hash to keep dataset identity
-        new_quiz_data = dict(quiz_data)
-        new_quiz_data["questions"] = shuffled_questions
-
-        if isinstance(selected_id, str) and selected_id.startswith("file:"):
-            current_path = selected_id.split(":", 1)[1]
-            try:
-                dataset_to_csv(new_quiz_data, current_path, selected_map={})
-            except Exception:
-                pass
-        new_state = default_state(new_quiz_data.get("hash"))
-        fb = html.Div([
-            html.Div("Attempt submitted.", className="fw-semibold"),
-            html.Small(f"Score: {pct}%", className="text-muted")
-        ], className="alert alert-info")
-        return new_state, stats, fb, new_quiz_data
-
-    # Not finished: persist partial progress directly into dataset CSV's Selected column
-    if isinstance(selected_id, str) and selected_id.startswith("file:"):
-        current_path = selected_id.split(":", 1)[1]
-        try:
-            # Build selected_map from new_state
-            sel_map: Dict[int, List[int]] = {}
-            for k, v in (new_state.get("answers", {}) or {}).items():
-                try:
-                    i = int(k)
-                except Exception:
-                    continue
-                sel_map[i] = list(v.get("selected", []))
-            dataset_to_csv(quiz_data, current_path, selected_map=sel_map)
-        except Exception:
-            pass
-    # Return without changing quiz_data
+    total_score = 0.0
+    exact_correct = 0
+    full_answers: Dict[str, Any] = {}
+    for i in range(n):
+        rec = (new_state.get("answers", {}) or {}).get(str(i), {}) or {}
+        ch_i = rec.get("selected", []) or []
+        corr_i = quiz_data.get("questions", [])[i].get("correct", [])
+        sc_i, _ = score_answer(ch_i, corr_i, mode)
+        total_score += sc_i
+        exact_correct += 1 if set(ch_i) == set(corr_i) else 0
+        full_answers[str(i)] = {"selected": ch_i, "correct": set(ch_i) == set(corr_i), "score": sc_i}
+    new_state["answers"] = full_answers
+    new_state["review"] = True
+    if mode == "aon":
+        pct = round((exact_correct / n) * 100, 2) if n else 0
+        points = float(exact_correct)
+    else:
+        pct = round((total_score / n) * 100, 2) if n else 0
+        points = float(round(total_score, 4))
+    # Show review with option to add to plot; do not log automatically
+    fb = render_attempt_summary(quiz_data, new_state, mode, show_save=True, saved=False)
     return new_state, no_update, fb, no_update
+
+def _summarize_question_label(text: str, idx: int) -> str:
+    s = str(text or "").replace("\r", "").replace("\n", " ").strip()
+    s = s[:60]
+    return f"{idx+1}. {s}"
 
 
 @callback(
-    Output("progress_plot", "figure", allow_duplicate=True),
-    Input("quiz_stats", "data"),
-    State("quiz_data", "data"),
+    Output("quiz_jump_select", "options", allow_duplicate=True),
+    Output("quiz_jump_select", "value", allow_duplicate=True),
+    Input("quiz_data", "data"),
+    Input("quiz_state", "data"),
     prevent_initial_call=True,
 )
-def render_progress_plot(stats, quiz_data):
-    # Render attempts for current dataset hash
+def update_quiz_jump_options(quiz_data, state):
     if not quiz_data:
-        return {"data": [], "layout": {"paper_bgcolor": "rgba(0,0,0,0)", "plot_bgcolor": "rgba(0,0,0,0)", "xaxis": {"title": "Attempt"}, "yaxis": {"title": "% correct", "range": [0, 100]}}}
-    dataset_key = quiz_data.get("hash")
-    series = (stats or {}).get(dataset_key, [])
-    if not series:
-        return {"data": [], "layout": {"paper_bgcolor": "rgba(0,0,0,0)", "plot_bgcolor": "rgba(0,0,0,0)", "xaxis": {"title": "Attempt"}, "yaxis": {"title": "% correct", "range": [0, 100]}}}
-    x = list(range(1, len(series) + 1))
-    y = [pt.get("pct", 0) for pt in series]
-    fig = {
-        "data": [
-            {"type": "scatter", "mode": "lines+markers", "x": x, "y": y, "line": {"color": "#6f9eff"}, "marker": {"color": "#6f9eff"}},
-        ],
-        "layout": {
-            "paper_bgcolor": "rgba(0,0,0,0)",
-            "plot_bgcolor": "rgba(0,0,0,0)",
-            "xaxis": {"title": "Attempt", "gridcolor": "rgba(255,255,255,.08)", "tickfont": {"color": "#e5e7eb"}, "titlefont": {"color": "#e5e7eb"}, "tickmode": "linear", "dtick": 1},
-            "yaxis": {"title": "% correct", "range": [0, 100], "gridcolor": "rgba(255,255,255,.08)", "tickfont": {"color": "#e5e7eb"}, "titlefont": {"color": "#e5e7eb"}},
-            "font": {"color": "#e5e7eb"},
-            "margin": {"l": 50, "r": 20, "t": 10, "b": 40},
-        },
-    }
-    return fig
+        return [], None
+    qs = quiz_data.get("questions", [])
+    options = []
+    for i, q in enumerate(qs):
+        full = str(q.get("q", "") or "").replace("\r", "").replace("\n", " ").strip()
+        preview = full[:40]
+        label = html.Div(f"Q{i+1}: {preview}", title=full)
+        options.append({"label": label, "value": i})
+    cur = min(max(0, int((state or {}).get("current", 0))), max(0, len(qs) - 1)) if qs else None
+    return options, cur
 
 
 @callback(
     Output("quiz_data", "data", allow_duplicate=True),
     Output("quiz_state", "data", allow_duplicate=True),
     Output("feedback", "children", allow_duplicate=True),
+    Output("feedback_auto_clear", "disabled", allow_duplicate=True),
     Input("btn_shuffle_options", "n_clicks"),
     State("quiz_data", "data"),
     State("quiz_state", "data"),
@@ -1233,19 +1508,22 @@ def on_shuffle_options(nc, quiz_data, state, selected_id):
                 except Exception:
                     continue
                 sel_map[i] = list(rv.get("selected", []))
-            dataset_to_csv(new_quiz_data, current_path, selected_map=sel_map)
+            dataset_save_autodetect(new_quiz_data, current_path, selected_map=sel_map)
         except Exception:
             pass
 
     new_state = dict(state or {})
     new_state["answers"] = new_answers
+    new_state["review"] = False
     msg = html.Div("Alternativ slumpade (svar bevarade).", className="alert alert-info")
-    return new_quiz_data, new_state, msg
+    # Enable auto-clear timer
+    return new_quiz_data, new_state, msg, False
 
 @callback(
     Output("quiz_data", "data", allow_duplicate=True),
     Output("quiz_state", "data", allow_duplicate=True),
     Output("feedback", "children", allow_duplicate=True),
+    Output("feedback_auto_clear", "disabled", allow_duplicate=True),
     Input("btn_shuffle_questions", "n_clicks"),
     State("quiz_data", "data"),
     State("quiz_state", "data"),
@@ -1301,15 +1579,154 @@ def on_shuffle_questions(nc, quiz_data, state, selected_id):
                 except Exception:
                     continue
                 sel_map[i] = list(rv.get("selected", []))
-            dataset_to_csv(new_quiz_data, current_path, selected_map=sel_map)
+            dataset_save_autodetect(new_quiz_data, current_path, selected_map=sel_map)
         except Exception:
             pass
 
     new_state = dict(state or {})
     new_state["answers"] = new_answers
     new_state["current"] = new_current
+    new_state["review"] = False
     msg = html.Div("Frågor slumpade (svar bevarade).", className="alert alert-info")
+    # Enable auto-clear timer
+    return new_quiz_data, new_state, msg, False
+
+
+@callback(
+    Output("quiz_state", "data", allow_duplicate=True),
+    Input("quiz_jump_select", "value"),
+    State("quiz_state", "data"),
+    State("quiz_data", "data"),
+    prevent_initial_call=True,
+)
+def on_quiz_jump_select(target_idx, state, quiz_data):
+    # Jump to a specific question. We don't depend on answer_input here to avoid missing-component errors.
+    if target_idx is None or not state or not quiz_data:
+        raise PreventUpdate
+    n = len(quiz_data.get("questions", []))
+    if not isinstance(target_idx, int) or target_idx < 0 or target_idx >= n:
+        raise PreventUpdate
+    new_state = dict(state)
+    new_state["current"] = target_idx
+    new_state["review"] = False
+    return new_state
+
+
+@callback(
+    Output("feedback", "children", allow_duplicate=True),
+    Output("feedback_auto_clear", "disabled", allow_duplicate=True),
+    Input("feedback_auto_clear", "n_intervals"),
+    State("feedback_auto_clear", "disabled"),
+    prevent_initial_call=True,
+)
+def clear_feedback_on_timer(n, disabled):
+    # When timer fires and it's enabled, clear the feedback and stop the timer
+    if disabled:
+        raise PreventUpdate
+    if n is None or n == 0:
+        raise PreventUpdate
+    return html.Div(), True
+
+
+@callback(
+    Output("quiz_data", "data", allow_duplicate=True),
+    Output("quiz_state", "data", allow_duplicate=True),
+    Output("feedback", "children", allow_duplicate=True),
+    Input("btn_start_new_run", "n_clicks"),
+    State("quiz_data", "data"),
+    State("selected_dataset", "data"),
+    prevent_initial_call=True,
+)
+def on_start_new_run(nc, quiz_data, selected_id):
+    if not nc or not quiz_data:
+        raise PreventUpdate
+    # Randomize option order per question, then shuffle questions
+    opt_shuffled: List[Dict[str, Any]] = []
+    for q in (quiz_data.get("questions", []) or []):
+        opts = list(q.get("options", []))
+        order = list(range(len(opts)))
+        random.shuffle(order)
+        new_opts = [opts[i] for i in order]
+        correct_set = set(q.get("correct", []) or [])
+        new_correct = [j for j, old_i in enumerate(order) if old_i in correct_set]
+        opt_shuffled.append({"q": q.get("q", ""), "options": new_opts, "correct": new_correct})
+    shuffled_questions = list(opt_shuffled)
+    random.shuffle(shuffled_questions)
+    new_quiz_data = dict(quiz_data)
+    new_quiz_data["questions"] = shuffled_questions
+    # Persist to CSV and clear Selected
+    if isinstance(selected_id, str) and selected_id.startswith("file:"):
+        current_path = selected_id.split(":", 1)[1]
+        try:
+            dataset_save_autodetect(new_quiz_data, current_path, selected_map={})
+        except Exception:
+            pass
+    # Reset state
+    new_state = default_state(new_quiz_data.get("hash"))
+    msg = html.Div("Ny runda startad.", className="alert alert-info")
     return new_quiz_data, new_state, msg
+
+
+@callback(
+    Output("quiz_stats", "data", allow_duplicate=True),
+    Output("feedback", "children", allow_duplicate=True),
+    Input("btn_save_to_plot", "n_clicks"),
+    State("quiz_stats", "data"),
+    State("quiz_data", "data"),
+    State("quiz_state", "data"),
+    State("scoring_mode", "value"),
+    prevent_initial_call=True,
+)
+def on_save_attempt_to_plot(nc, stats, quiz_data, state, scoring_mode):
+    if not nc or not quiz_data or not state:
+        raise PreventUpdate
+    qs = quiz_data.get("questions", [])
+    n = len(qs)
+    mode = scoring_mode or "aon"
+    # Compute pct (same rules as submit)
+    if mode == "aon":
+        correct = sum(1 for i in range(n) if (state.get("answers", {}) or {}).get(str(i), {}).get("correct"))
+        points = float(correct)
+        pct = round((correct / n) * 100, 2) if n else 0
+    else:
+        total_score = 0.0
+        for i in range(n):
+            rec = (state.get("answers", {}) or {}).get(str(i), {}) or {}
+            if "score" in rec:
+                total_score += float(rec.get("score", 0.0))
+            else:
+                ch = rec.get("selected", []) or []
+                corr_i = qs[i].get("correct", [])
+                s_i, _ = score_answer(ch, corr_i, mode)
+                total_score += s_i
+        points = float(round(total_score, 4))
+        pct = round((total_score / n) * 100, 2) if n else 0
+        correct = int(round(total_score))
+    # Append to stats
+    stats = stats or {}
+    dataset_key = quiz_data.get("hash")
+    arr = list(stats.get(dataset_key, []))
+    arr.append({"ts": datetime.utcnow().isoformat() + "Z", "total": n, "correct": correct, "pct": pct, "points": points})
+    stats[dataset_key] = arr
+    # Re-render summary indicating it's saved (hide button)
+    fb = render_attempt_summary(quiz_data, state, mode, show_save=False, saved=True)
+    return stats, fb
+
+
+@callback(
+    Output("feedback", "children", allow_duplicate=True),
+    Output("quiz_state", "data", allow_duplicate=True),
+    Input("btn_close_review", "n_clicks"),
+    State("quiz_state", "data"),
+    prevent_initial_call=True,
+)
+def on_close_review(nc, state):
+    # Hide the result panel and allow user to continue editing answers
+    if not nc or not state:
+        raise PreventUpdate
+    new_state = dict(state)
+    new_state["review"] = False
+    return html.Div(), new_state
 
 @callback(
     Output("quiz_state", "data", allow_duplicate=True),
@@ -1334,6 +1751,7 @@ def on_answer_change(selected, state, quiz_data, selected_id):
     prev = answers.get(str(idx), {})
     answers[str(idx)] = {"selected": chosen, "correct": prev.get("correct")}
     new_state["answers"] = answers
+    new_state["review"] = False
     # Write to dataset CSV if a file is selected
     if isinstance(selected_id, str) and selected_id.startswith("file:"):
         current_path = selected_id.split(":", 1)[1]
@@ -1345,7 +1763,7 @@ def on_answer_change(selected, state, quiz_data, selected_id):
                 except Exception:
                     continue
                 sel_map[i] = list(v.get("selected", []))
-            dataset_to_csv(quiz_data, current_path, selected_map=sel_map)
+            dataset_save_autodetect(quiz_data, current_path, selected_map=sel_map)
         except Exception:
             pass
     return new_state
@@ -1387,11 +1805,12 @@ def on_next(n_clicks, state, quiz_data, selected, selected_id):
                     except Exception:
                         continue
                     sel_map[i] = list(v.get("selected", []))
-                dataset_to_csv(quiz_data, current_path, selected_map=sel_map)
+                dataset_save_autodetect(quiz_data, current_path, selected_map=sel_map)
             except Exception:
                 pass
     idx2 = min(n - 1, idx + 1)
     new_state["current"] = idx2
+    new_state["review"] = False
     return new_state
 
 
@@ -1426,11 +1845,12 @@ def on_prev(n_clicks, state, quiz_data, selected, selected_id):
                     except Exception:
                         continue
                     sel_map[i] = list(v.get("selected", []))
-                dataset_to_csv(quiz_data, current_path, selected_map=sel_map)
+                dataset_save_autodetect(quiz_data, current_path, selected_map=sel_map)
             except Exception:
                 pass
     idx2 = max(0, idx - 1)
     new_state["current"] = idx2
+    new_state["review"] = False
     return new_state
 
 
@@ -1449,7 +1869,7 @@ def on_reset(n_clicks, quiz_data, selected_id):
     if isinstance(selected_id, str) and selected_id.startswith("file:"):
         current_path = selected_id.split(":", 1)[1]
         try:
-            dataset_to_csv(quiz_data, current_path, selected_map={})
+            dataset_save_autodetect(quiz_data, current_path, selected_map={})
         except Exception:
             pass
     return default_state(quiz_data.get("hash")), html.Div()
@@ -1467,6 +1887,44 @@ def _options_from_text(text: str) -> List[str]:
 
 def _labels_for_options(options: List[str]) -> List[Dict[str, Any]]:
     return [{"label": f"{chr(ord('A')+i)}. {opt}", "value": i} for i, opt in enumerate(options)]
+
+
+@callback(
+    Output("download_export", "data"),
+    Input("btn_export_excel", "n_clicks"),
+    State("quiz_data", "data"),
+    prevent_initial_call=True,
+)
+def export_to_excel(nc, quiz_data):
+    if not nc or not quiz_data:
+        raise PreventUpdate
+    qs = quiz_data.get("questions", []) or []
+    if not qs:
+        raise PreventUpdate
+    # Compute max number of options across questions
+    max_opts = max((len(q.get("options", []) or []) for q in qs), default=0)
+    # Build rows
+    rows = []
+    for q in qs:
+        opts = list(q.get("options", []) or [])
+        corr = list(q.get("correct", []) or [])
+        row = {"Question": q.get("q", "")}
+        # Option columns A..N
+        for i in range(max_opts):
+            label = f"Option {chr(ord('A')+i)}"
+            row[label] = opts[i] if i < len(opts) else ""
+        # Correct letters (A,B,...) joined by comma
+        letters = [chr(ord('A')+i) for i in corr if isinstance(i, int) and 0 <= i < len(opts)]
+        row["Correct"] = ", ".join(letters)
+        rows.append(row)
+    df = pd.DataFrame(rows)
+    # Try Excel first; if engine not available, fall back to CSV
+    try:
+        import openpyxl  # noqa: F401
+        return dcc.send_data_frame(df.to_excel, f"{(quiz_data.get('title') or 'quiz').strip() or 'quiz'}.xlsx", index=False, sheet_name="Questions")
+    except Exception:
+        # Fallback CSV
+        return dcc.send_data_frame(df.to_csv, f"{(quiz_data.get('title') or 'quiz').strip() or 'quiz'}.csv", index=False, sep=";")
 
 
 @callback(
@@ -1621,7 +2079,7 @@ def create_file_when_titled(title, quiz_data, new_mode):
         # ensure dataset carries the title
         working = dict(quiz_data)
         working["title"] = title
-        dataset_to_csv(working, path)
+        dataset_save_autodetect(working, path)
     except Exception as e:
         return no_update, no_update, no_update, html.Small(f"Kunde inte spara: {e}", className="text-danger"), no_update, no_update, no_update
     # Reload folder and select new file
@@ -1705,6 +2163,8 @@ def editor_new_dataset_start(nc):
     status = html.Small("New dataset mode: enter a title to create the file.", className="text-muted")
     return new, "editor", html.Div("Fill in a title to create the dataset.", className="text-info"), None, None, status, True
 
+
+## Removed: Export to JSON (JSON is now the default save format)
 
 if __name__ == "__main__":
     # Run the Dash app (Dash 3.x+)
